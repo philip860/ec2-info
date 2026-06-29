@@ -1,0 +1,142 @@
+---
+- name: Install AAP 2.7 containerized from S3-hosted installer
+  hosts: aap
+  become: true
+  gather_facts: true
+
+  vars:
+    aap_hostname: aap.demo.lab.com
+    aap_shortname: aap
+    aap_install_user: aapadmin
+    aap_work_dir: /opt
+
+    aap_installer_url: "https://aap-containerized-installers.s3.us-east-1.amazonaws.com/2.7/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
+    aap_installer_tarball: "{{ aap_work_dir }}/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
+
+    gateway_admin_username: admin
+    gateway_admin_password: "ChangeMeStrongPassword123!"
+    postgresql_admin_password: "ChangeMePostgresPassword123!"
+
+    registry_username: "YOUR_REDHAT_REGISTRY_USERNAME"
+    registry_password: "YOUR_REDHAT_REGISTRY_PASSWORD"
+
+  tasks:
+    - name: Install required packages
+      ansible.builtin.dnf:
+        name:
+          - ansible-core
+          - wget
+          - rsync
+          - git
+          - podman
+          - tar
+        state: present
+
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: "{{ aap_hostname }}"
+
+    - name: Get primary IPv4 address
+      ansible.builtin.set_fact:
+        aap_ipv4: "{{ ansible_default_ipv4.address }}"
+
+    - name: Update /etc/hosts with AAP hostname
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^\S+\s+{{ aap_hostname | regex_escape }}(\s|$)'
+        line: "{{ aap_ipv4 }} {{ aap_hostname }} {{ aap_shortname }}"
+        state: present
+        create: true
+
+    - name: Create AAP install user
+      ansible.builtin.user:
+        name: "{{ aap_install_user }}"
+        shell: /bin/bash
+        create_home: true
+
+    - name: Allow AAP install user passwordless sudo
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ aap_install_user }}"
+        content: "{{ aap_install_user }} ALL=(ALL) NOPASSWD: ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+
+    - name: Download AAP 2.7 containerized installer from S3
+      ansible.builtin.get_url:
+        url: "{{ aap_installer_url }}"
+        dest: "{{ aap_installer_tarball }}"
+        mode: "0644"
+        timeout: 1800
+
+    - name: Extract AAP installer under /opt
+      ansible.builtin.unarchive:
+        src: "{{ aap_installer_tarball }}"
+        dest: "{{ aap_work_dir }}"
+        remote_src: true
+        owner: "{{ aap_install_user }}"
+        group: "{{ aap_install_user }}"
+
+    - name: Find extracted AAP installer directory
+      ansible.builtin.find:
+        paths: "{{ aap_work_dir }}"
+        file_type: directory
+        patterns:
+          - "ansible-automation-platform-containerized-setup*"
+      register: installer_dirs
+
+    - name: Set installer directory path
+      ansible.builtin.set_fact:
+        aap_installer_dir: "{{ (installer_dirs.files | sort(attribute='path') | last).path }}"
+
+    - name: Write custom AAP inventory
+      ansible.builtin.copy:
+        dest: "{{ aap_installer_dir }}/inventory"
+        owner: "{{ aap_install_user }}"
+        group: "{{ aap_install_user }}"
+        mode: "0600"
+        content: |
+          [automationgateway]
+          {{ aap_hostname }} ansible_connection=local
+
+          [automationcontroller]
+          {{ aap_hostname }} ansible_connection=local
+
+          [automationhub]
+          {{ aap_hostname }} ansible_connection=local
+
+          [eda]
+          {{ aap_hostname }} ansible_connection=local
+
+          [database]
+          {{ aap_hostname }} ansible_connection=local
+
+          [all:vars]
+          ansible_user={{ aap_install_user }}
+
+          gateway_admin_username={{ gateway_admin_username }}
+          gateway_admin_password={{ gateway_admin_password }}
+
+          controller_admin_password={{ gateway_admin_password }}
+          hub_admin_password={{ gateway_admin_password }}
+          eda_admin_password={{ gateway_admin_password }}
+
+          postgresql_admin_username=postgres
+          postgresql_admin_password={{ postgresql_admin_password }}
+
+          registry_username={{ registry_username }}
+          registry_password={{ registry_password }}
+
+    - name: Run AAP 2.7 containerized installer
+      become: true
+      become_user: "{{ aap_install_user }}"
+      ansible.builtin.command:
+        cmd: ansible-playbook -i inventory ansible.containerized_installer.install
+        chdir: "{{ aap_installer_dir }}"
+      register: aap_install_result
+      changed_when: true
+
+    - name: Show installer output
+      ansible.builtin.debug:
+        var: aap_install_result.stdout_lines
