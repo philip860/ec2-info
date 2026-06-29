@@ -9,6 +9,8 @@
     aap_short_name: "aap"
 
     aap_work_dir: "/opt"
+    aap_run_user: "ec2-user"
+
     aap_installer_url: "https://aap-containerized-installers.s3.us-east-1.amazonaws.com/2.7/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
     aap_installer_tarball: "{{ aap_work_dir }}/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
 
@@ -72,11 +74,6 @@
         - name: Clean DNF metadata
           ansible.builtin.command: dnf clean all
           changed_when: true
-
-        - name: Show available Ansible repositories
-          ansible.builtin.command: subscription-manager repos --list
-          register: rhsm_repos
-          changed_when: false
 
         - name: Enable AAP repositories
           ansible.builtin.command: >
@@ -183,12 +180,26 @@
 
     - name: PHASE 7 | Copy and update AAP containerized inventory
       block:
+        - name: Get ec2-user UID
+          ansible.builtin.command: id -u "{{ aap_run_user }}"
+          register: aap_run_user_uid
+          changed_when: false
+
+        - name: Get ec2-user home directory
+          ansible.builtin.command: getent passwd "{{ aap_run_user }}"
+          register: aap_run_user_passwd
+          changed_when: false
+
+        - name: Set ec2-user home fact
+          ansible.builtin.set_fact:
+            aap_run_user_home: "{{ aap_run_user_passwd.stdout.split(':')[5] }}"
+
         - name: Copy base inventory from project files directory
           ansible.builtin.copy:
             src: files/inventory
             dest: "{{ aap_installer_dir }}/inventory"
-            owner: root
-            group: root
+            owner: "{{ aap_run_user }}"
+            group: "{{ aap_run_user }}"
             mode: "0600"
 
         - name: Replace placeholder hostname with target AAP FQDN
@@ -197,11 +208,32 @@
             regexp: 'aap\.example\.com'
             replace: "{{ aap_fqdn }}"
 
-        - name: Ensure ansible_user_uid is set to ec2-user
+        - name: Ensure ansible_user is ec2-user
+          ansible.builtin.lineinfile:
+            path: "{{ aap_installer_dir }}/inventory"
+            regexp: '^ansible_user='
+            line: "ansible_user={{ aap_run_user }}"
+            insertafter: BOF
+
+        - name: Ensure ansible_user_uid is numeric non-root UID
           ansible.builtin.lineinfile:
             path: "{{ aap_installer_dir }}/inventory"
             regexp: '^ansible_user_uid='
-            line: 'ansible_user_uid=ec2-user'
+            line: "ansible_user_uid={{ aap_run_user_uid.stdout }}"
+            insertafter: BOF
+
+        - name: Ensure ansible_user_dir is ec2-user home
+          ansible.builtin.lineinfile:
+            path: "{{ aap_installer_dir }}/inventory"
+            regexp: '^ansible_user_dir='
+            line: "ansible_user_dir={{ aap_run_user_home }}"
+            insertafter: BOF
+
+        - name: Ensure become is enabled for installer target
+          ansible.builtin.lineinfile:
+            path: "{{ aap_installer_dir }}/inventory"
+            regexp: '^ansible_become='
+            line: "ansible_become=true"
             insertafter: BOF
 
         - name: Append required secret variables to inventory
@@ -233,15 +265,28 @@
               automationmetrics_controller_read_pg_password={{ automationmetrics_controller_read_pg_password }}
           no_log: true
 
-    - name: PHASE 8 | Run AAP 2.7 containerized installer
-      ansible.builtin.command:
-        cmd: ansible-playbook -i inventory ansible.containerized_installer.install
+        - name: Give ec2-user ownership of installer directory
+          ansible.builtin.file:
+            path: "{{ aap_installer_dir }}"
+            owner: "{{ aap_run_user }}"
+            group: "{{ aap_run_user }}"
+            recurse: true
+
+    - name: PHASE 8 | Run AAP 2.7 containerized installer as ec2-user
+      ansible.builtin.shell: |
+        set -o pipefail
+        ansible-playbook -i inventory ansible.containerized_installer.install \
+          2>&1 | tee "{{ aap_run_user_home }}/aap-containerized-installer.log"
+      args:
         chdir: "{{ aap_installer_dir }}"
+        executable: /bin/bash
+      become: true
+      become_user: "{{ aap_run_user }}"
+      environment:
+        HOME: "{{ aap_run_user_home }}"
       register: aap_installer_output
-      async: 7200
-      poll: 120
       changed_when: true
-      no_log: false
+      failed_when: aap_installer_output.rc != 0
 
     - name: PHASE 9 | Post-install validation
       block:
@@ -264,3 +309,4 @@
               - "AAP 2.7 containerized install completed."
               - "AAP Gateway URL: https://{{ aap_fqdn }}"
               - "Admin username: {{ gateway_admin_username }}"
+              - "Installer log: /home/ec2-user/aap-containerized-installer.log"
