@@ -241,7 +241,7 @@
       async: 7200
       poll: 120
       changed_when: true
-      no_log: true
+      no_log: false
 
     - name: PHASE 9 | Post-install validation
       block:
