@@ -28,7 +28,7 @@
     - vars-aap-vault.yml
 
   tasks:
-    - name: PHASE 0 | Fix RHSM repo management
+    - name: PHASE 0 | Prepare RHSM repo management
       block:
         - name: Remove AWS RHUI client packages
           ansible.builtin.dnf:
@@ -46,9 +46,11 @@
             line: 'manage_repos = 1'
             state: present
 
-        - name: Refresh subscription-manager metadata
-          ansible.builtin.command: subscription-manager refresh
-          changed_when: true
+        - name: Check current RHSM registration status
+          ansible.builtin.command: subscription-manager status
+          register: rhsm_status
+          changed_when: false
+          failed_when: false
 
     - name: PHASE 1 | Register and enable AAP repos
       block:
@@ -67,6 +69,10 @@
           ansible.builtin.command: subscription-manager refresh
           changed_when: true
 
+        - name: Clean DNF metadata
+          ansible.builtin.command: dnf clean all
+          changed_when: true
+
         - name: Show available Ansible repositories
           ansible.builtin.command: subscription-manager repos --list
           register: rhsm_repos
@@ -77,6 +83,10 @@
             subscription-manager repos --enable {{ item }}
           loop: "{{ aap_repos }}"
           changed_when: true
+
+        - name: Refresh DNF cache
+          ansible.builtin.dnf:
+            update_cache: true
 
     - name: PHASE 2 | Hostname and cloud-init hardening
       block:
