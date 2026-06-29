@@ -12,11 +12,6 @@
     aap_installer_url: "https://aap-containerized-installers.s3.us-east-1.amazonaws.com/2.7/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
     aap_installer_tarball: "{{ aap_work_dir }}/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
 
-    # Use RHEL 10 repo IDs if this EC2 instance is RHEL 10.
-    rhel_base_repos:
-      - rhel-10-for-x86_64-baseos-rpms
-      - rhel-10-for-x86_64-appstream-rpms
-
     aap_repos:
       - ansible-automation-platform-2.7-for-rhel-10-x86_64-rpms
 
@@ -33,21 +28,29 @@
     - vars-aap-vault.yml
 
   tasks:
-    - name: PHASE 0 | Remove AWS RHUI and enable subscription-manager repo management
+    - name: PHASE 0 | Fix RHSM repo management
       block:
         - name: Remove AWS RHUI client packages
           ansible.builtin.dnf:
             name: "rh-amazon-rhui-client*"
             state: absent
 
-        - name: Enable subscription-manager repo management
+        - name: Force subscription-manager to manage repos
+          ansible.builtin.command: subscription-manager config --rhsm.manage_repos=1
+          changed_when: true
+
+        - name: Ensure rhsm.conf has manage_repos enabled
           ansible.builtin.lineinfile:
             path: /etc/rhsm/rhsm.conf
             regexp: '^manage_repos\s*='
             line: 'manage_repos = 1'
             state: present
 
-    - name: PHASE 1 | Register with Red Hat Subscription Manager
+        - name: Refresh subscription-manager metadata
+          ansible.builtin.command: subscription-manager refresh
+          changed_when: true
+
+    - name: PHASE 1 | Register and enable AAP repos
       block:
         - name: Register system with activation key
           community.general.redhat_subscription:
@@ -56,15 +59,18 @@
             org_id: "{{ aap_org_id }}"
             force_register: true
 
-        - name: Disable all repositories
-          ansible.builtin.command: subscription-manager repos --disable "*"
+        - name: Force subscription-manager repo management after registration
+          ansible.builtin.command: subscription-manager config --rhsm.manage_repos=1
           changed_when: true
 
-        - name: Enable required RHEL repositories
-          ansible.builtin.command: >
-            subscription-manager repos --enable {{ item }}
-          loop: "{{ rhel_base_repos }}"
+        - name: Refresh subscription-manager after registration
+          ansible.builtin.command: subscription-manager refresh
           changed_when: true
+
+        - name: Show available Ansible repositories
+          ansible.builtin.command: subscription-manager repos --list
+          register: rhsm_repos
+          changed_when: false
 
         - name: Enable AAP repositories
           ansible.builtin.command: >
@@ -194,18 +200,27 @@
             marker: "# {mark} ANSIBLE MANAGED AAP SECRETS"
             insertafter: EOF
             block: |
-              gateway_admin_username={{ gateway_admin_username }}
-              gateway_admin_password={{ gateway_admin_password }}
-
-              postgresql_admin_username=postgres
+              postgresql_admin_username={{ postgresql_admin_username }}
               postgresql_admin_password={{ postgresql_admin_password }}
 
               registry_username={{ registry_username }}
               registry_password={{ registry_password }}
 
-              controller_admin_password={{ gateway_admin_password }}
-              hub_admin_password={{ gateway_admin_password }}
-              eda_admin_password={{ gateway_admin_password }}
+              gateway_admin_username={{ gateway_admin_username }}
+              gateway_admin_password={{ gateway_admin_password }}
+              gateway_pg_password={{ gateway_pg_password }}
+
+              controller_admin_password={{ controller_admin_password }}
+              controller_pg_password={{ controller_pg_password }}
+
+              hub_admin_password={{ hub_admin_password }}
+              hub_pg_password={{ hub_pg_password }}
+
+              eda_admin_password={{ eda_admin_password }}
+              eda_pg_password={{ eda_pg_password }}
+
+              automationmetrics_pg_password={{ automationmetrics_pg_password }}
+              automationmetrics_controller_read_pg_password={{ automationmetrics_controller_read_pg_password }}
           no_log: true
 
     - name: PHASE 8 | Run AAP 2.7 containerized installer
