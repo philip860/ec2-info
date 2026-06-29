@@ -99,14 +99,6 @@
 
     - name: PHASE 3 | Configure IPv4-only hosts resolution
       block:
-        - name: Strip myhostname plugin from nsswitch configuration
-          ansible.builtin.lineinfile:
-            path: /etc/nsswitch.conf
-            regexp: '^hosts:\s+.*'
-            line: 'hosts:      files dns'
-            state: present
-          register: nsswitch_updated
-
         - name: Configure /etc/hosts with IPv4-only AAP FQDN
           ansible.builtin.copy:
             dest: /etc/hosts
@@ -117,12 +109,6 @@
             owner: root
             group: root
             mode: "0644"
-
-        - name: Restart NetworkManager
-          ansible.builtin.service:
-            name: NetworkManager
-            state: restarted
-          when: nsswitch_updated.changed
 
     - name: PHASE 4 | Install required packages
       ansible.builtin.dnf:
