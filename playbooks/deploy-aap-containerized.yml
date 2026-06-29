@@ -1,6 +1,6 @@
 ---
 - name: Install AAP 2.7 Containerized on AWS EC2
-  hosts: aap_controllers
+  hosts: all
   become: true
   gather_facts: true
 
