@@ -1,142 +1,241 @@
 ---
-- name: Install AAP 2.7 containerized from S3-hosted installer
-  hosts: aap
+- name: Install AAP 2.7 Containerized on AWS EC2
+  hosts: aap_controllers
   become: true
   gather_facts: true
 
   vars:
-    aap_hostname: aap.demo.lab.com
-    aap_shortname: aap
-    aap_install_user: aapadmin
-    aap_work_dir: /opt
+    aap_fqdn: "aap.demo.lab.com"
+    aap_short_name: "aap"
 
+    aap_work_dir: "/opt"
     aap_installer_url: "https://aap-containerized-installers.s3.us-east-1.amazonaws.com/2.7/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
     aap_installer_tarball: "{{ aap_work_dir }}/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
 
-    gateway_admin_username: admin
-    gateway_admin_password: "ChangeMeStrongPassword123!"
-    postgresql_admin_password: "ChangeMePostgresPassword123!"
+    # Use RHEL 10 repo IDs if this EC2 instance is RHEL 10.
+    rhel_base_repos:
+      - rhel-10-for-x86_64-baseos-rpms
+      - rhel-10-for-x86_64-appstream-rpms
 
-    registry_username: "YOUR_REDHAT_REGISTRY_USERNAME"
-    registry_password: "YOUR_REDHAT_REGISTRY_PASSWORD"
+    aap_repos:
+      - ansible-automation-platform-2.7-for-rhel-10-x86_64-rpms
+
+    required_packages:
+      - ansible-core
+      - wget
+      - rsync
+      - git
+      - podman
+      - tar
+      - firewalld
+
+  vars_files:
+    - vars-aap-vault.yml
 
   tasks:
-    - name: Install required packages
+    - name: PHASE 0 | Remove AWS RHUI and enable subscription-manager repo management
+      block:
+        - name: Remove AWS RHUI client packages
+          ansible.builtin.dnf:
+            name: "rh-amazon-rhui-client*"
+            state: absent
+
+        - name: Enable subscription-manager repo management
+          ansible.builtin.lineinfile:
+            path: /etc/rhsm/rhsm.conf
+            regexp: '^manage_repos\s*='
+            line: 'manage_repos = 1'
+            state: present
+
+    - name: PHASE 1 | Register with Red Hat Subscription Manager
+      block:
+        - name: Register system with activation key
+          community.general.redhat_subscription:
+            state: present
+            activationkey: "{{ aap_activation_key }}"
+            org_id: "{{ aap_org_id }}"
+            force_register: true
+
+        - name: Disable all repositories
+          ansible.builtin.command: subscription-manager repos --disable "*"
+          changed_when: true
+
+        - name: Enable required RHEL repositories
+          ansible.builtin.command: >
+            subscription-manager repos --enable {{ item }}
+          loop: "{{ rhel_base_repos }}"
+          changed_when: true
+
+        - name: Enable AAP repositories
+          ansible.builtin.command: >
+            subscription-manager repos --enable {{ item }}
+          loop: "{{ aap_repos }}"
+          changed_when: true
+
+    - name: PHASE 2 | Hostname and cloud-init hardening
+      block:
+        - name: Set persistent AAP hostname
+          ansible.builtin.hostname:
+            name: "{{ aap_fqdn }}"
+
+        - name: Ensure cloud-init preserves hostname across reboots
+          ansible.builtin.lineinfile:
+            path: /etc/cloud/cloud.cfg
+            regexp: '^preserve_hostname:'
+            line: 'preserve_hostname: true'
+            state: present
+
+    - name: PHASE 3 | Configure /etc/hosts and DNS resolution
+      block:
+        - name: Strip myhostname plugin from nsswitch configuration
+          ansible.builtin.lineinfile:
+            path: /etc/nsswitch.conf
+            regexp: '^hosts:\s+files\s+dns\s+myhostname'
+            line: 'hosts:      files dns'
+            state: present
+          register: nsswitch_updated
+
+        - name: Restart NetworkManager if nsswitch changed
+          ansible.builtin.service:
+            name: NetworkManager
+            state: restarted
+          when: nsswitch_updated.changed
+
+        - name: Configure /etc/hosts with AAP FQDN
+          ansible.builtin.copy:
+            dest: /etc/hosts
+            content: |
+              127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+              ::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+              {{ ansible_default_ipv4.address }} {{ aap_fqdn }} {{ aap_short_name }}
+            owner: root
+            group: root
+            mode: "0644"
+
+    - name: PHASE 4 | Install required packages
       ansible.builtin.dnf:
-        name:
-          - ansible-core
-          - wget
-          - rsync
-          - git
-          - podman
-          - tar
+        name: "{{ required_packages }}"
         state: present
 
-    - name: Set hostname
-      ansible.builtin.hostname:
-        name: "{{ aap_hostname }}"
+    - name: PHASE 5 | Configure firewall for AAP containerized services
+      block:
+        - name: Start and enable firewalld
+          ansible.builtin.service:
+            name: firewalld
+            state: started
+            enabled: true
 
-    - name: Get primary IPv4 address
-      ansible.builtin.set_fact:
-        aap_ipv4: "{{ ansible_default_ipv4.address }}"
+        - name: Open required TCP ports
+          ansible.posix.firewalld:
+            port: "{{ item }}/tcp"
+            permanent: true
+            state: enabled
+            immediate: true
+          loop:
+            - 80
+            - 443
+            - 5432
+            - 6379
+            - 27199
 
-    - name: Update /etc/hosts with AAP hostname
-      ansible.builtin.lineinfile:
-        path: /etc/hosts
-        regexp: '^\S+\s+{{ aap_hostname | regex_escape }}(\s|$)'
-        line: "{{ aap_ipv4 }} {{ aap_hostname }} {{ aap_shortname }}"
-        state: present
-        create: true
+    - name: PHASE 6 | Download and extract AAP 2.7 containerized installer
+      block:
+        - name: Download AAP 2.7 containerized installer from S3
+          ansible.builtin.get_url:
+            url: "{{ aap_installer_url }}"
+            dest: "{{ aap_installer_tarball }}"
+            mode: "0644"
+            timeout: 1800
 
-    - name: Create AAP install user
-      ansible.builtin.user:
-        name: "{{ aap_install_user }}"
-        shell: /bin/bash
-        create_home: true
+        - name: Extract AAP installer under /opt
+          ansible.builtin.unarchive:
+            src: "{{ aap_installer_tarball }}"
+            dest: "{{ aap_work_dir }}"
+            remote_src: true
 
-    - name: Allow AAP install user passwordless sudo
-      ansible.builtin.copy:
-        dest: "/etc/sudoers.d/{{ aap_install_user }}"
-        content: "{{ aap_install_user }} ALL=(ALL) NOPASSWD: ALL\n"
-        owner: root
-        group: root
-        mode: "0440"
-        validate: "visudo -cf %s"
+        - name: Find extracted AAP installer directory
+          ansible.builtin.find:
+            paths: "{{ aap_work_dir }}"
+            file_type: directory
+            patterns:
+              - "ansible-automation-platform-containerized-setup*"
+          register: installer_dirs
 
-    - name: Download AAP 2.7 containerized installer from S3
-      ansible.builtin.get_url:
-        url: "{{ aap_installer_url }}"
-        dest: "{{ aap_installer_tarball }}"
-        mode: "0644"
-        timeout: 1800
+        - name: Set AAP installer directory fact
+          ansible.builtin.set_fact:
+            aap_installer_dir: "{{ (installer_dirs.files | sort(attribute='path') | last).path }}"
 
-    - name: Extract AAP installer under /opt
-      ansible.builtin.unarchive:
-        src: "{{ aap_installer_tarball }}"
-        dest: "{{ aap_work_dir }}"
-        remote_src: true
-        owner: "{{ aap_install_user }}"
-        group: "{{ aap_install_user }}"
+    - name: PHASE 7 | Copy and update AAP containerized inventory
+      block:
+        - name: Copy base inventory from project files directory
+          ansible.builtin.copy:
+            src: files/inventory
+            dest: "{{ aap_installer_dir }}/inventory"
+            owner: root
+            group: root
+            mode: "0600"
 
-    - name: Find extracted AAP installer directory
-      ansible.builtin.find:
-        paths: "{{ aap_work_dir }}"
-        file_type: directory
-        patterns:
-          - "ansible-automation-platform-containerized-setup*"
-      register: installer_dirs
+        - name: Replace placeholder hostname with target AAP FQDN
+          ansible.builtin.replace:
+            path: "{{ aap_installer_dir }}/inventory"
+            regexp: 'aap\.example\.com'
+            replace: "{{ aap_fqdn }}"
 
-    - name: Set installer directory path
-      ansible.builtin.set_fact:
-        aap_installer_dir: "{{ (installer_dirs.files | sort(attribute='path') | last).path }}"
+        - name: Ensure ansible_user_uid is set to ec2-user
+          ansible.builtin.lineinfile:
+            path: "{{ aap_installer_dir }}/inventory"
+            regexp: '^ansible_user_uid='
+            line: 'ansible_user_uid=ec2-user'
+            insertafter: BOF
 
-    - name: Write custom AAP inventory
-      ansible.builtin.copy:
-        dest: "{{ aap_installer_dir }}/inventory"
-        owner: "{{ aap_install_user }}"
-        group: "{{ aap_install_user }}"
-        mode: "0600"
-        content: |
-          [automationgateway]
-          {{ aap_hostname }} ansible_connection=local
+        - name: Append required secret variables to inventory
+          ansible.builtin.blockinfile:
+            path: "{{ aap_installer_dir }}/inventory"
+            marker: "# {mark} ANSIBLE MANAGED AAP SECRETS"
+            insertafter: EOF
+            block: |
+              gateway_admin_username={{ gateway_admin_username }}
+              gateway_admin_password={{ gateway_admin_password }}
 
-          [automationcontroller]
-          {{ aap_hostname }} ansible_connection=local
+              postgresql_admin_username=postgres
+              postgresql_admin_password={{ postgresql_admin_password }}
 
-          [automationhub]
-          {{ aap_hostname }} ansible_connection=local
+              registry_username={{ registry_username }}
+              registry_password={{ registry_password }}
 
-          [eda]
-          {{ aap_hostname }} ansible_connection=local
+              controller_admin_password={{ gateway_admin_password }}
+              hub_admin_password={{ gateway_admin_password }}
+              eda_admin_password={{ gateway_admin_password }}
+          no_log: true
 
-          [database]
-          {{ aap_hostname }} ansible_connection=local
-
-          [all:vars]
-          ansible_user={{ aap_install_user }}
-
-          gateway_admin_username={{ gateway_admin_username }}
-          gateway_admin_password={{ gateway_admin_password }}
-
-          controller_admin_password={{ gateway_admin_password }}
-          hub_admin_password={{ gateway_admin_password }}
-          eda_admin_password={{ gateway_admin_password }}
-
-          postgresql_admin_username=postgres
-          postgresql_admin_password={{ postgresql_admin_password }}
-
-          registry_username={{ registry_username }}
-          registry_password={{ registry_password }}
-
-    - name: Run AAP 2.7 containerized installer
-      become: true
-      become_user: "{{ aap_install_user }}"
+    - name: PHASE 8 | Run AAP 2.7 containerized installer
       ansible.builtin.command:
         cmd: ansible-playbook -i inventory ansible.containerized_installer.install
         chdir: "{{ aap_installer_dir }}"
-      register: aap_install_result
+      register: aap_installer_output
+      async: 7200
+      poll: 120
       changed_when: true
+      no_log: true
 
-    - name: Show installer output
-      ansible.builtin.debug:
-        var: aap_install_result.stdout_lines
+    - name: PHASE 9 | Post-install validation
+      block:
+        - name: Wait for AAP Gateway to become available
+          ansible.builtin.uri:
+            url: "https://{{ aap_fqdn }}/api/gateway/v1/status/"
+            validate_certs: false
+            status_code:
+              - 200
+              - 401
+              - 403
+          register: aap_gateway_health
+          retries: 20
+          delay: 30
+          until: aap_gateway_health.status in [200, 401, 403]
+
+        - name: Display AAP access information
+          ansible.builtin.debug:
+            msg:
+              - "AAP 2.7 containerized install completed."
+              - "AAP Gateway URL: https://{{ aap_fqdn }}"
+              - "Admin username: {{ gateway_admin_username }}"
