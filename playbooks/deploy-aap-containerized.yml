@@ -7,10 +7,9 @@
   vars:
     aap_fqdn: "aap.demo.lab.com"
     aap_short_name: "aap"
-
-    aap_work_dir: "/opt"
     aap_run_user: "ec2-user"
 
+    aap_work_dir: "/opt"
     aap_installer_url: "https://aap-containerized-installers.s3.us-east-1.amazonaws.com/2.7/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
     aap_installer_tarball: "{{ aap_work_dir }}/ansible-automation-platform-containerized-setup-bundle-2.7-1.2-x86_64.tar.gz"
 
@@ -98,23 +97,17 @@
             line: 'preserve_hostname: true'
             state: present
 
-    - name: PHASE 3 | Configure /etc/hosts and DNS resolution
+    - name: PHASE 3 | Configure IPv4-only hosts resolution
       block:
         - name: Strip myhostname plugin from nsswitch configuration
           ansible.builtin.lineinfile:
             path: /etc/nsswitch.conf
-            regexp: '^hosts:\s+files\s+dns\s+myhostname'
+            regexp: '^hosts:\s+.*'
             line: 'hosts:      files dns'
             state: present
           register: nsswitch_updated
 
-        - name: Restart NetworkManager if nsswitch changed
-          ansible.builtin.service:
-            name: NetworkManager
-            state: restarted
-          when: nsswitch_updated.changed
-
-        - name: Configure /etc/hosts with AAP FQDN
+        - name: Configure /etc/hosts with IPv4-only AAP FQDN
           ansible.builtin.copy:
             dest: /etc/hosts
             content: |
@@ -124,6 +117,12 @@
             owner: root
             group: root
             mode: "0644"
+
+        - name: Restart NetworkManager
+          ansible.builtin.service:
+            name: NetworkManager
+            state: restarted
+          when: nsswitch_updated.changed
 
     - name: PHASE 4 | Install required packages
       ansible.builtin.dnf:
@@ -185,7 +184,7 @@
           register: aap_run_user_uid
           changed_when: false
 
-        - name: Get ec2-user home directory
+        - name: Get ec2-user passwd entry
           ansible.builtin.command: getent passwd "{{ aap_run_user }}"
           register: aap_run_user_passwd
           changed_when: false
@@ -208,33 +207,25 @@
             regexp: 'aap\.example\.com'
             replace: "{{ aap_fqdn }}"
 
-        - name: Ensure ansible_user is ec2-user
-          ansible.builtin.lineinfile:
+        - name: Force installer inventory to connect over IPv4
+          ansible.builtin.blockinfile:
             path: "{{ aap_installer_dir }}/inventory"
-            regexp: '^ansible_user='
-            line: "ansible_user={{ aap_run_user }}"
+            marker: "# {mark} ANSIBLE MANAGED IPV4 CONNECTION"
             insertafter: BOF
+            block: |
+              ansible_host={{ ansible_default_ipv4.address }}
+              routable_hostname={{ ansible_default_ipv4.address }}
+              ansible_user={{ aap_run_user }}
+              ansible_user_uid={{ aap_run_user_uid.stdout }}
+              ansible_user_dir={{ aap_run_user_home }}
+              ansible_become=true
 
-        - name: Ensure ansible_user_uid is numeric non-root UID
+        - name: Ensure automation gateway public URL uses FQDN
           ansible.builtin.lineinfile:
             path: "{{ aap_installer_dir }}/inventory"
-            regexp: '^ansible_user_uid='
-            line: "ansible_user_uid={{ aap_run_user_uid.stdout }}"
-            insertafter: BOF
-
-        - name: Ensure ansible_user_dir is ec2-user home
-          ansible.builtin.lineinfile:
-            path: "{{ aap_installer_dir }}/inventory"
-            regexp: '^ansible_user_dir='
-            line: "ansible_user_dir={{ aap_run_user_home }}"
-            insertafter: BOF
-
-        - name: Ensure become is enabled for installer target
-          ansible.builtin.lineinfile:
-            path: "{{ aap_installer_dir }}/inventory"
-            regexp: '^ansible_become='
-            line: "ansible_become=true"
-            insertafter: BOF
+            regexp: '^automationgateway_main_url='
+            line: "automationgateway_main_url=https://{{ aap_fqdn }}"
+            insertafter: EOF
 
         - name: Append required secret variables to inventory
           ansible.builtin.blockinfile:
@@ -272,11 +263,23 @@
             group: "{{ aap_run_user }}"
             recurse: true
 
+    - name: PHASE 8 | Check if AAP Gateway is already responding
+      ansible.builtin.uri:
+        url: "https://{{ aap_fqdn }}/api/gateway/v1/status/"
+        validate_certs: false
+        status_code:
+          - 200
+          - 401
+          - 403
+      register: existing_aap_gateway
+      failed_when: false
+      changed_when: false
+
     - name: PHASE 8 | Run AAP 2.7 containerized installer as ec2-user
       ansible.builtin.shell: |
-        set -o pipefail
         ansible-playbook -i inventory ansible.containerized_installer.install \
-          2>&1 | tee "{{ aap_run_user_home }}/aap-containerized-installer.log"
+          > "{{ aap_run_user_home }}/aap-containerized-installer.log" 2>&1
+        echo $? > "{{ aap_run_user_home }}/aap-containerized-installer.rc"
       args:
         chdir: "{{ aap_installer_dir }}"
         executable: /bin/bash
@@ -284,9 +287,26 @@
       become_user: "{{ aap_run_user }}"
       environment:
         HOME: "{{ aap_run_user_home }}"
-      register: aap_installer_output
       changed_when: true
-      failed_when: aap_installer_output.rc != 0
+      when: existing_aap_gateway.status not in [200, 401, 403]
+
+    - name: Read AAP installer return code
+      ansible.builtin.slurp:
+        src: "{{ aap_run_user_home }}/aap-containerized-installer.rc"
+      register: aap_installer_rc_raw
+      when: existing_aap_gateway.status not in [200, 401, 403]
+
+    - name: Set AAP installer return code fact
+      ansible.builtin.set_fact:
+        aap_installer_rc: "{{ aap_installer_rc_raw.content | b64decode | trim }}"
+      when: existing_aap_gateway.status not in [200, 401, 403]
+
+    - name: Fail if AAP installer failed
+      ansible.builtin.fail:
+        msg: "AAP installer failed. Check {{ aap_run_user_home }}/aap-containerized-installer.log"
+      when:
+        - existing_aap_gateway.status not in [200, 401, 403]
+        - aap_installer_rc != "0"
 
     - name: PHASE 9 | Post-install validation
       block:
